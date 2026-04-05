@@ -109,7 +109,9 @@ pip install corvid-remember
 corvid install
 ```
 
-That is it. Two commands. `pip install` gets the CLI and all dependencies (semantic search included). `corvid install` auto-detects your agents (Claude Code, Codex CLI) and installs the `/remember` skill for each.
+Two commands. That is it.
+
+`pip install` gets the CLI and semantic search (33MB model, CPU only). `corvid install` finds your agents and sets up `/remember` for each one.
 
 ```
 $ corvid install
@@ -125,22 +127,16 @@ $ corvid install
 
 Open any project. Say `/remember`. Done.
 
-### Alternative: install via npx skills
+### Keyword-only mode
 
-```bash
-npx skills add juraxis/corvid
-pip install fastembed sqlite-vec   # for semantic search
-corvid init                        # or: python3 ~/.claude/skills/remember/corvid.py init
-```
-
-### Keyword-only mode (no heavy dependencies)
+If you want a lighter install without the embedding model:
 
 ```bash
 pip install corvid-remember[lite]
 corvid install
 ```
 
-Keyword search works out of the box via SQLite FTS5. Semantic search requires the full install.
+Keyword search works out of the box via SQLite FTS5. Semantic search activates when you install the full version.
 
 ## Search
 
