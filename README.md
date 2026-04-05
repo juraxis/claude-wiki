@@ -1,28 +1,25 @@
 # claude-wiki
 
-A cross-project knowledge base for Claude Code. One slash command, one Python script, zero dependencies.
+Cross-project memory for Claude Code with semantic search. One command: `/remember`.
 
-Say `/remember` and Claude distills what you just learned into a searchable wiki. Next session, next project, next month, it is still there.
+## The problem
 
-## Why not just use Claude's built-in memory?
+Claude Code forgets everything between sessions. Its built-in memory is per-project, caps at 200 lines, and has no search. You solve a hard problem in one project, start a new project next month, and Claude has no idea it ever happened.
 
-Claude Code already has memory at `~/.claude/projects/*/memory/`. It is fine for a single project. But if you work across many projects, you will hit these walls:
+claude-wiki fixes that. Say `/remember` and Claude writes what you learned into a searchable wiki. Every project feeds the same knowledge base. Search finds articles by meaning, not just keywords, using a 33MB local embedding model that runs on CPU.
 
 | | Built-in memory | claude-wiki |
 |---|---|---|
-| Scope | Per-project | Cross-project, one wiki for everything |
-| Limit | Truncates at 200 lines | Unlimited articles |
-| Search | None, loads files in order | Full-text search with ranking (SQLite FTS5) |
-| Trigger | Claude decides automatically | You decide with `/remember` |
-| Access | Only in that project | Searchable from any project |
-
-One project? Built-in memory works. Five projects? Ten? You need knowledge that travels with you.
+| Scope | Per-project | Cross-project |
+| Limit | 200 lines | Unlimited |
+| Search | None | Hybrid: keyword + semantic |
+| Control | Claude decides | You decide with `/remember` |
 
 ## How it works
 
-### A lawyer reviewing an M&A deal
+### A lawyer three sessions into diligence
 
-You are three sessions deep into diligence. You just discovered that the target's key customer contract has a change-of-control termination right covering 38% of ARR.
+You just found that the target's key customer contract has a change-of-control termination right threatening 38% of ARR.
 
 ```
 You: /remember
@@ -32,93 +29,79 @@ Claude writes:
 
   # Acme Acquisition - Change of Control Risk
   Key customer contract (38% of ARR, $4.2M) contains change-of-control
-  termination right in Section 12.3. No consent obtained. Must be
-  closing condition or renegotiated pre-sign...
+  termination right in Section 12.3. No consent obtained...
 ```
 
-Two weeks later, different project, different client. Similar deal structure.
+Two weeks later, different client, similar deal:
 
 ```
 You: "Review this target's customer contracts for COC risk"
 
 Claude searches the wiki automatically
   -> finds the Acme article
-  -> already knows the pattern, the risk, and what to look for
+  -> already knows the pattern and what to look for
 ```
 
-You never re-explained. You never re-discovered. The lesson carried over.
+### A developer who just burned two hours
 
-### A developer vibe-coding across repos
-
-You just burned two hours debugging why your auth flow breaks after deploy. Turns out the session cookie needs `SameSite=None` with `Secure` when running behind a reverse proxy, and the redirect URI has to match the exact casing registered with the OAuth provider.
+Your auth flow breaks after deploy. Session cookie needs `SameSite=None` with `Secure` behind a reverse proxy, and the redirect URI must match the exact casing registered with the OAuth provider.
 
 ```
 You: /remember
-
-Claude writes:
-  ~/claude-wiki/wiki/debugging/oauth-redirect-behind-proxy.md
 ```
 
-Three months later, different app, same deploy setup. You start wiring up auth and Claude already knows the gotcha. Two hours saved. Multiply that across every hard-won lesson in every repo you touch.
+Three months later, different app, same deploy setup. Claude already knows. Two hours saved.
 
 ## Inspired by Karpathy's LLM Wiki
 
-Karpathy's [llm-wiki pattern](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f) describes building persistent knowledge bases with LLMs: ingest sources into a `raw/` directory, have the LLM compile them into a structured markdown wiki, then query and refine over time. The LLM does the tedious bookkeeping. The human directs and reads. Knowledge compounds.
-
-We borrowed that core idea. But our entry point is different.
+Karpathy's [llm-wiki pattern](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f) builds persistent knowledge bases by ingesting external docs into a wiki. We borrowed the core idea but changed the entry point: your source material is the conversation itself, not external files.
 
 | | Karpathy's LLM Wiki | claude-wiki |
 |---|---|---|
-| Source material | External docs (papers, articles, repos) | Your conversation with Claude |
-| Ingest step | Copy files to `raw/`, LLM compiles | `/remember` distills in real-time |
-| Wiki compilation | LLM reads raw, writes summaries | Claude writes directly from context |
-| Search | qmd (BM25 + vector + re-ranking) | Hybrid: FTS5 keyword + semantic vector (optional) |
-| Frontend | Obsidian | Any editor, or just let Claude read it |
-| Best for | Research knowledge (papers, datasets) | Working knowledge (decisions, findings, gotchas) |
+| Source | External docs, papers, repos | Your conversation with Claude |
+| Ingest | Copy to `raw/`, LLM compiles | `/remember` distills in real-time |
+| Search | qmd (BM25 + vector + re-ranking) | Hybrid: FTS5 keyword + semantic vector |
+| Best for | Research knowledge | Working knowledge |
 
-Karpathy's system is a research librarian. This system is a working notebook.
+His system is a research librarian. This is a working notebook. They compose if you want both.
 
-If you want both, they compose. Use his approach for ingesting papers and articles. Use this for capturing what you learn while working. They write to different directories and do not conflict.
-
-## Setup (2 minutes)
-
-### 1. Copy the files
+## Setup
 
 ```bash
-mkdir -p ~/claude-wiki/wiki
-mkdir -p ~/.claude/skills/remember
+# Install
+mkdir -p ~/claude-wiki/wiki ~/.claude/skills/remember
 cp wiki.py ~/claude-wiki/wiki.py
 cp SKILL.md ~/.claude/skills/remember/SKILL.md
-```
-
-### 2. Initialize
-
-```bash
 python3 ~/claude-wiki/wiki.py init
+
+# Optional: enable semantic search (33MB model, CPU only, no GPU)
+pip install fastembed sqlite-vec
 ```
 
-That creates the SQLite database. Done.
+Open Claude Code in any project. Say `/remember`. Done.
 
-### 3. Use it
+## Search
 
-Open Claude Code in any project and say `/remember`. Claude distills the current insight, writes an article, indexes it, and updates the table of contents.
+Keyword search works out of the box via SQLite FTS5 with Porter stemming and BM25 ranking. "Finetuning" matches "fine-tuned."
 
-To search manually:
+With `fastembed` + `sqlite-vec` installed, semantic search activates automatically. Searching "concurrent writes deadlock" finds your article about a "race condition" even though it never uses those words. The embedding model ([bge-small-en-v1.5](https://huggingface.co/BAAI/bge-small-en-v1.5)) is 33MB, runs on CPU in ~50ms per article, and needs no GPU, no PyTorch, no server.
+
+Both modes run together. Keyword first, then semantic fills in what keyword missed. If the packages are not installed, it falls back to keyword-only silently.
 
 ```bash
 python3 ~/claude-wiki/wiki.py search "change of control"
-python3 ~/claude-wiki/wiki.py search "session cookie proxy" --json
+python3 ~/claude-wiki/wiki.py search "indemnity structure" --json
 python3 ~/claude-wiki/wiki.py stats
 ```
 
 ## What gets saved
 
-Claude writes markdown articles organized by category. You never touch the structure. Claude picks the category, names the file, writes the content, and maintains the index.
+Claude writes markdown articles organized by category. You never touch the structure.
 
 ```
 ~/claude-wiki/
-  wiki.py              # search engine (~300 lines, Python stdlib only)
-  wiki.db              # search index (auto-created, disposable, rebuildable)
+  wiki.py              # one file, Python stdlib + optional fastembed/sqlite-vec
+  wiki.db              # search index (disposable, rebuildable from articles)
   INDEX.md             # table of contents Claude maintains
   wiki/
     contracts/
@@ -126,53 +109,19 @@ Claude writes markdown articles organized by category. You never touch the struc
       termination-for-convenience.md
     litigation/
       discovery-scope-preservation.md
-      fmla-retaliation-risk.md
     debugging/
       oauth-redirect-behind-proxy.md
 ```
 
-These are real articles with tables, exact numbers, specific commands, and the reasoning behind decisions. Not chat logs. Not raw dumps. Written so that a future Claude session, or you, can read them and act immediately.
+Real articles with tables, exact numbers, specific commands, reasoning. Not chat logs.
 
 ## Use cases
 
-### Legal work
+**Legal**: diligence findings that carry across deals, clause review patterns, jurisdictional research, settlement positions with exact dollar figures.
 
-- Diligence findings that carry across deals: indemnity structures, IP ownership gaps, regulatory exposure patterns
-- Clause review history: what the counterparty pushed back on, what the partner approved, what language worked
-- Jurisdictional research that applies to future matters in the same state
-- Settlement positions across rounds with exact dollar figures, deadlines, and carrier status
+**Technical**: architecture decisions and why, deployment fixes with the exact config, API quirks that took hours to find, evaluation results with real numbers.
 
-### Technical work
-
-- Architecture decisions: why you chose this pattern, what you considered, what failed
-- Deployment fixes: the exact config that solved the production issue, not a vague note that "it was a config problem"
-- API quirks: version-specific behavior, undocumented limits, workarounds that took hours to find
-- Training and evaluation results: exact scores, hyperparameters, what worked and what regressed
-
-### Any multi-project workflow
-
-You learn something in Project A. Months later in Project B, you need it. Without a cross-project wiki, it is gone. With `/remember`, Claude finds it.
-
-## Search: keyword + semantic
-
-Out of the box, wiki.py uses SQLite FTS5 for keyword search with Porter stemming and BM25 ranking. Searching "finetuning" matches "fine-tuned." Fast and accurate for known terms.
-
-If you install two optional packages, semantic search activates automatically:
-
-```bash
-pip install fastembed sqlite-vec
-```
-
-Now searching "concurrent writes deadlock" finds your article about a "race condition" even though it never mentions those words. The embedding model is `bge-small-en-v1.5` (33MB, runs on CPU, ~50ms per article at index time). Search itself is a SQLite vector distance lookup, near instant.
-
-Both modes run together. Keyword results come first (ranked by BM25), then semantic results fill in what keyword missed. No config needed. If the packages are not installed, it falls back to keyword-only silently.
-
-## Technical details
-
-- **wiki.py** is one Python file. Core search uses only the Python standard library (SQLite FTS5). Semantic search is optional via `fastembed` + `sqlite-vec`.
-- **SKILL.md** is a Claude Code skill file. Drop it in `~/.claude/skills/remember/` and it shows up in every session. The description tells Claude the wiki exists and how to search it, so recall is automatic.
-- The database is a disposable cache. Delete `wiki.db` and run `wiki.py index-all` to rebuild from the markdown files. The articles are the source of truth, not the database.
-- Articles are plain markdown. Read them in any editor, grep them, point Obsidian at them, or just let Claude handle everything.
+**Anything multi-project**: you learn it once, `/remember`, it is there forever.
 
 ## Commands
 
@@ -181,10 +130,10 @@ Both modes run together. Keyword results come first (ranked by BM25), then seman
 | `wiki.py init` | Create the database |
 | `wiki.py index <file>` | Index one markdown file |
 | `wiki.py index-all` | Re-index all files in wiki/ |
-| `wiki.py search <query>` | Search (human-readable output) |
-| `wiki.py search <query> --json` | Search (JSON output for Claude) |
-| `wiki.py stats` | Show article count by category |
+| `wiki.py search <query>` | Search (human-readable) |
+| `wiki.py search <query> --json` | Search (JSON for Claude) |
+| `wiki.py stats` | Show article counts |
 
 ## License
 
-MIT. Use it however you want.
+MIT
