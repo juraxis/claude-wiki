@@ -21,30 +21,60 @@ corvid fixes that. Every project feeds one shared knowledge base. Search finds t
 You spend 90 minutes figuring out why a background job deadlocks only under production concurrency.
 
 ```
-You: /remember
+You: /remember the root cause of the job queue deadlock and the fix
+
+corvid writes:
+  ~/corvid/wiki/debugging/job-queue-deadlock-under-load.md
+
+  # Job Queue Deadlock Under Production Load
+  Root cause: connection pool exhaustion when >50 concurrent workers
+  hit the same advisory lock. Misleading symptom: jobs appeared
+  "stuck" but were actually queued behind a leaked connection.
+  Fix: set pool_timeout=30 and add advisory_lock_timeout=5000ms.
+  Verify: run 100 concurrent jobs in staging with CONCURRENCY=100.
 ```
 
-corvid saves the root cause, what looked misleading, the fix, and how to verify it. Three projects later, same stack, similar symptom. Your agent finds the article and starts from the answer.
+Three projects later, same stack, similar symptom. Your agent finds the article and starts from the answer.
 
 ### The lawyer working with AI
 
 You are reviewing a target's contracts and find that a change-of-control clause puts a meaningful share of revenue at risk.
 
 ```
-You: /remember
+You: /remember the COC termination risk pattern and what mitigation worked
+
+corvid writes:
+  ~/corvid/wiki/contracts/coc-termination-risk-pattern.md
+
+  # Change of Control - Termination Risk Pattern
+  Key customer contract (38% of ARR, $4.2M) contains change-of-control
+  termination right in Section 12.3. No consent obtained.
+  Mitigation: make consent a closing condition, or negotiate a
+  standstill period with 120-day notice before termination takes effect.
+  Fallback: purchase price adjustment tied to at-risk revenue.
 ```
 
-corvid saves the clause pattern, why it matters, what follow-up to request, and what mitigation language actually worked. Next deal, same pattern. Your agent already knows what to flag.
+Next deal, same pattern. Your agent already knows what to flag, what to ask for, and what language worked last time.
 
 ### The vibe-coder with too many projects
 
-One week it is a deploy config. Next week a webhook edge case. Then a schema drift between local and remote. Each one takes an hour. Each one feels obvious after you solve it. Each one gets forgotten anyway.
+One week it is a deploy config. Next week a webhook edge case. Then a schema drift between local and remote.
 
 ```
-You: /remember
+You: /remember why the Stripe webhook kept failing silently
+
+corvid writes:
+  ~/corvid/wiki/debugging/stripe-webhook-silent-failure.md
+
+  # Stripe Webhook Silent Failure
+  Webhook returns 200 but event is not processed. Root cause:
+  the endpoint was verifying with the test-mode signing secret
+  in production. Stripe retries 3x then gives up. No error
+  in logs because verification middleware swallows the exception.
+  Fix: separate STRIPE_WEBHOOK_SECRET per environment in .env.
 ```
 
-Those become searchable articles instead of disappearing into chat history.
+Each fix takes an hour. Each one feels obvious afterward. Each one used to get forgotten. Now they are searchable articles instead of disappearing chat history.
 
 ## What people actually save
 
