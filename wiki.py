@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-wiki.py — Personal knowledge wiki with FTS5 search.
+wiki.py -- Personal knowledge wiki with hybrid search (keyword + semantic).
 
 Commands:
     python wiki.py init                  Create database
@@ -9,6 +9,10 @@ Commands:
     python wiki.py search <query>        Search (human-readable)
     python wiki.py search <query> --json Search (machine-readable)
     python wiki.py stats                 Show article counts
+
+Search modes:
+    Default: hybrid (keyword + semantic). Falls back to keyword-only if
+    fastembed/sqlite-vec are not installed. No config needed.
 """
 
 import sqlite3
@@ -19,10 +23,48 @@ import hashlib
 from datetime import datetime
 from pathlib import Path
 
+# ── Optional: semantic search dependencies ────────────────────
+_SEMANTIC_AVAILABLE = False
+_embedding_model = None
+
+try:
+    import sqlite_vec
+
+    _VEC_AVAILABLE = True
+except ImportError:
+    _VEC_AVAILABLE = False
+
+try:
+    from fastembed import TextEmbedding
+
+    _FASTEMBED_AVAILABLE = True
+except ImportError:
+    _FASTEMBED_AVAILABLE = False
+
+_SEMANTIC_AVAILABLE = _VEC_AVAILABLE and _FASTEMBED_AVAILABLE
+EMBED_DIM = 384  # bge-small-en-v1.5
+EMBED_MODEL = "BAAI/bge-small-en-v1.5"
+
 # ── Configuration ──────────────────────────────────────────────
 WIKI_DIR = os.environ.get("CLAUDE_WIKI", os.path.expanduser("~/claude-wiki"))
 DB_PATH = os.path.join(WIKI_DIR, "wiki.db")
 ARTICLES_DIR = os.path.join(WIKI_DIR, "wiki")
+
+
+def _get_embedding_model():
+    global _embedding_model
+    if _embedding_model is None and _FASTEMBED_AVAILABLE:
+        _embedding_model = TextEmbedding(EMBED_MODEL)
+    return _embedding_model
+
+
+def _embed(text):
+    """Embed a single text string. Returns list of floats."""
+    model = _get_embedding_model()
+    if model is None:
+        return None
+    results = list(model.embed([text[:8000]]))
+    return results[0].tolist()
 
 
 def get_db():
@@ -30,12 +72,23 @@ def get_db():
     os.makedirs(WIKI_DIR, exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
-    # Auto-create schema if missing
+    if _VEC_AVAILABLE:
+        conn.enable_load_extension(True)
+        sqlite_vec.load(conn)
     tables = conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table' AND name='articles'"
     ).fetchone()
     if not tables:
         _init_schema(conn)
+    # Auto-add vec table if semantic became available after initial init
+    if _SEMANTIC_AVAILABLE:
+        vec_exists = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='articles_vec'"
+        ).fetchone()
+        if not vec_exists:
+            conn.execute(
+                f"CREATE VIRTUAL TABLE articles_vec USING vec0(embedding float[{EMBED_DIM}])"
+            )
     return conn
 
 
@@ -80,6 +133,10 @@ def _init_schema(conn):
             VALUES (new.id, new.title, new.category, new.content);
         END;
     """)
+    if _SEMANTIC_AVAILABLE:
+        conn.execute(
+            f"CREATE VIRTUAL TABLE IF NOT EXISTS articles_vec USING vec0(embedding float[{EMBED_DIM}])"
+        )
 
 
 # ── Index ──────────────────────────────────────────────────────
@@ -99,22 +156,18 @@ def cmd_index(filepath, category=None):
 
     filehash = hashlib.sha256(content.encode()).hexdigest()
 
-    # Extract title from first heading
     title = os.path.basename(filepath)
     for line in content.split("\n"):
         if line.startswith("# "):
             title = line[2:].strip()
             break
 
-    # Detect category from path: wiki/<category>/file.md
     if category is None:
         rel = os.path.relpath(filepath, ARTICLES_DIR)
         parts = Path(rel).parts
         category = parts[0] if len(parts) > 1 else "general"
 
-    # Detect source project from cwd
     source_project = os.path.basename(os.getcwd())
-
     now = datetime.now().isoformat()
 
     conn = get_db()
@@ -135,6 +188,17 @@ def cmd_index(filepath, category=None):
                 (filehash, title, category, content, source_project, now, filepath),
             )
             conn.commit()
+            article_id = existing["id"]
+            # Update embedding
+            if _SEMANTIC_AVAILABLE:
+                vec = _embed(f"{title}\n{content}")
+                if vec:
+                    conn.execute("DELETE FROM articles_vec WHERE rowid = ?", (article_id,))
+                    conn.execute(
+                        "INSERT INTO articles_vec(rowid, embedding) VALUES (?, ?)",
+                        (article_id, json.dumps(vec)),
+                    )
+                    conn.commit()
             print(f"UPDATED: {title} [{category}]")
             return True
         else:
@@ -145,6 +209,16 @@ def cmd_index(filepath, category=None):
                 (filepath, filehash, title, category, content, source_project, now, now),
             )
             conn.commit()
+            article_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+            # Store embedding
+            if _SEMANTIC_AVAILABLE:
+                vec = _embed(f"{title}\n{content}")
+                if vec:
+                    conn.execute(
+                        "INSERT INTO articles_vec(rowid, embedding) VALUES (?, ?)",
+                        (article_id, json.dumps(vec)),
+                    )
+                    conn.commit()
             print(f"INDEXED: {title} [{category}]")
             return True
     except sqlite3.Error as e:
@@ -155,11 +229,10 @@ def cmd_index(filepath, category=None):
 
 
 # ── Search ─────────────────────────────────────────────────────
-def cmd_search(query, limit=10, as_json=False):
-    """Full-text search with BM25 ranking."""
-    conn = get_db()
+def _keyword_search(conn, query, limit):
+    """FTS5 keyword search with BM25 ranking."""
     try:
-        results = conn.execute(
+        return conn.execute(
             """
             SELECT
                 a.id, a.title, a.category, a.filepath, a.source_project,
@@ -174,46 +247,109 @@ def cmd_search(query, limit=10, as_json=False):
             """,
             (query, limit),
         ).fetchall()
-    except sqlite3.OperationalError as e:
-        if as_json:
-            print(json.dumps({"error": str(e), "results": []}))
-        else:
-            print(f"Search error: {e}")
-            print("Tip: wrap phrases in quotes, avoid special characters like ( ) *")
+    except sqlite3.OperationalError:
         return []
+
+
+def _semantic_search(conn, query, limit):
+    """Vector similarity search using fastembed + sqlite-vec."""
+    if not _SEMANTIC_AVAILABLE:
+        return []
+    vec = _embed(query)
+    if not vec:
+        return []
+    rows = conn.execute(
+        """
+        SELECT
+            v.rowid AS id, v.distance,
+            a.title, a.category, a.filepath, a.source_project,
+            a.indexed_at, a.updated_at, a.content
+        FROM articles_vec v
+        JOIN articles a ON a.id = v.rowid
+        WHERE embedding MATCH ?
+            AND k = ?
+        """,
+        (json.dumps(vec), limit),
+    ).fetchall()
+    return rows
+
+
+def cmd_search(query, limit=10, as_json=False):
+    """Hybrid search: keyword + semantic, deduplicated and merged."""
+    conn = get_db()
+    try:
+        kw_results = _keyword_search(conn, query, limit)
+        sem_results = _semantic_search(conn, query, limit) if _SEMANTIC_AVAILABLE else []
     finally:
         conn.close()
 
-    if as_json:
-        out = []
-        for r in results:
-            out.append({
-                "id": r["id"],
+    # Merge: keyword results first (ranked by BM25), then semantic results not already in keyword set
+    seen_ids = set()
+    merged = []
+
+    for r in kw_results:
+        rid = r["id"]
+        if rid not in seen_ids:
+            seen_ids.add(rid)
+            merged.append({
+                "id": rid,
                 "title": r["title"],
                 "category": r["category"],
                 "filepath": r["filepath"],
                 "source_project": r["source_project"],
                 "snippet": r["snippet"],
-                "updated_at": r["updated_at"],
+                "updated_at": r["updated_at"] or r["indexed_at"] or "",
+                "match": "keyword",
             })
-        print(json.dumps({"query": query, "count": len(out), "results": out}, indent=2))
-        return results
 
-    if not results:
+    for r in sem_results:
+        rid = r["id"]
+        if rid not in seen_ids:
+            seen_ids.add(rid)
+            content = r["content"] or ""
+            # Build a snippet from first 200 chars
+            snippet = content[:200].replace("\n", " ").strip()
+            if len(content) > 200:
+                snippet += "..."
+            merged.append({
+                "id": rid,
+                "title": r["title"],
+                "category": r["category"],
+                "filepath": r["filepath"],
+                "source_project": r["source_project"],
+                "snippet": snippet,
+                "updated_at": r["updated_at"] or r["indexed_at"] or "",
+                "match": "semantic",
+            })
+
+    merged = merged[:limit]
+
+    if as_json:
+        print(json.dumps({
+            "query": query,
+            "count": len(merged),
+            "semantic_available": _SEMANTIC_AVAILABLE,
+            "results": merged,
+        }, indent=2))
+        return merged
+
+    if not merged:
         print(f"No results for: {query}")
         return []
 
+    mode = "hybrid (keyword + semantic)" if _SEMANTIC_AVAILABLE else "keyword only"
     print(f"\n{'─' * 60}")
-    print(f" Results for: {query}")
+    print(f" Results for: {query}  [{mode}]")
     print(f"{'─' * 60}\n")
-    for r in results:
-        date = (r["updated_at"] or r["indexed_at"] or "")[:10]
-        print(f"  [{r['category']}] {r['title']}")
+    for r in merged:
+        date = r["updated_at"][:10] if r["updated_at"] else "unknown"
+        match_tag = f" ({r['match']})" if _SEMANTIC_AVAILABLE else ""
+        print(f"  [{r['category']}] {r['title']}{match_tag}")
         print(f"  Date: {date}  |  Project: {r['source_project'] or 'n/a'}")
         print(f"  {r['snippet']}\n")
     print(f"{'─' * 60}")
-    print(f" {len(results)} result(s)")
-    return results
+    print(f" {len(merged)} result(s)")
+    return merged
 
 
 # ── Index All ──────────────────────────────────────────────────
@@ -232,6 +368,10 @@ def cmd_index_all():
                     count += 1
 
     print(f"\nRe-indexed {count} article(s)")
+    if _SEMANTIC_AVAILABLE:
+        print(f"Semantic embeddings: enabled ({EMBED_MODEL})")
+    else:
+        print("Semantic embeddings: disabled (install fastembed and sqlite-vec to enable)")
 
 
 # ── Stats ──────────────────────────────────────────────────────
@@ -243,12 +383,20 @@ def cmd_stats():
         cats = conn.execute(
             "SELECT category, COUNT(*) as c FROM articles GROUP BY category ORDER BY c DESC"
         ).fetchall()
+        vec_count = 0
+        if _SEMANTIC_AVAILABLE:
+            vec_count = conn.execute("SELECT COUNT(*) FROM articles_vec").fetchone()[0]
     finally:
         conn.close()
 
     print(f"\n  Wiki: {WIKI_DIR}")
     print(f"  Database: {DB_PATH}")
-    print(f"  Total articles: {total}\n")
+    print(f"  Total articles: {total}")
+    if _SEMANTIC_AVAILABLE:
+        print(f"  Embeddings: {vec_count}/{total} ({EMBED_MODEL})")
+    else:
+        print(f"  Embeddings: disabled (pip install fastembed sqlite-vec)")
+    print()
     for row in cats:
         print(f"    {row['category']:>16}: {row['c']}")
     print()
@@ -266,6 +414,10 @@ def main():
         conn = get_db()
         conn.close()
         print(f"Wiki ready at {WIKI_DIR}")
+        if _SEMANTIC_AVAILABLE:
+            print(f"Semantic search: enabled ({EMBED_MODEL})")
+        else:
+            print("Semantic search: disabled (pip install fastembed sqlite-vec)")
 
     elif cmd == "index":
         if len(sys.argv) < 3:

@@ -72,7 +72,7 @@ We borrowed that core idea. But our entry point is different.
 | Source material | External docs (papers, articles, repos) | Your conversation with Claude |
 | Ingest step | Copy files to `raw/`, LLM compiles | `/remember` distills in real-time |
 | Wiki compilation | LLM reads raw, writes summaries | Claude writes directly from context |
-| Search | qmd (BM25 + vector + re-ranking) | SQLite FTS5 (BM25 + Porter stemming) |
+| Search | qmd (BM25 + vector + re-ranking) | Hybrid: FTS5 keyword + semantic vector (optional) |
 | Frontend | Obsidian | Any editor, or just let Claude read it |
 | Best for | Research knowledge (papers, datasets) | Working knowledge (decisions, findings, gotchas) |
 
@@ -153,9 +153,23 @@ These are real articles with tables, exact numbers, specific commands, and the r
 
 You learn something in Project A. Months later in Project B, you need it. Without a cross-project wiki, it is gone. With `/remember`, Claude finds it.
 
+## Search: keyword + semantic
+
+Out of the box, wiki.py uses SQLite FTS5 for keyword search with Porter stemming and BM25 ranking. Searching "finetuning" matches "fine-tuned." Fast and accurate for known terms.
+
+If you install two optional packages, semantic search activates automatically:
+
+```bash
+pip install fastembed sqlite-vec
+```
+
+Now searching "concurrent writes deadlock" finds your article about a "race condition" even though it never mentions those words. The embedding model is `bge-small-en-v1.5` (33MB, runs on CPU, ~50ms per article at index time). Search itself is a SQLite vector distance lookup, near instant.
+
+Both modes run together. Keyword results come first (ranked by BM25), then semantic results fill in what keyword missed. No config needed. If the packages are not installed, it falls back to keyword-only silently.
+
 ## Technical details
 
-- **wiki.py** is one Python file. Zero dependencies beyond the standard library. SQLite FTS5 handles full-text search with Porter stemming (so "finetuning" matches "fine-tuned") and BM25 relevance ranking.
+- **wiki.py** is one Python file. Core search uses only the Python standard library (SQLite FTS5). Semantic search is optional via `fastembed` + `sqlite-vec`.
 - **SKILL.md** is a Claude Code skill file. Drop it in `~/.claude/skills/remember/` and it shows up in every session. The description tells Claude the wiki exists and how to search it, so recall is automatic.
 - The database is a disposable cache. Delete `wiki.db` and run `wiki.py index-all` to rebuild from the markdown files. The articles are the source of truth, not the database.
 - Articles are plain markdown. Read them in any editor, grep them, point Obsidian at them, or just let Claude handle everything.
