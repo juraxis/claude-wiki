@@ -57,9 +57,13 @@ Next session, any project, your agent pulls up what you already solved.
 
 ## Search
 
-Keyword search works out of the box (SQLite FTS5, Porter stemming). "Finetuning" matches "fine-tuned."
+Two search modes, both local, both fast.
 
-With the full install, semantic search runs on a 33MB local model. "Login callback issue" finds your article about "OAuth redirect" even though it never uses those words. No GPU. No server. No API calls.
+**Keyword** (always on): [SQLite FTS5](https://www.sqlite.org/fts5.html) with Porter stemming and BM25 ranking. "Finetuning" matches "fine-tuned." Zero dependencies.
+
+**Semantic** (full install): [fastembed](https://github.com/qdrant/fastembed) generates embeddings with a 33MB model ([bge-small-en-v1.5](https://huggingface.co/BAAI/bge-small-en-v1.5)), [sqlite-vec](https://github.com/asg017/sqlite-vec) stores and searches them inside the same SQLite database. "Login callback issue" finds your article about "OAuth redirect" even though it never uses those words. Runs on CPU in ~50ms. No GPU. No server. No API calls.
+
+Both modes run together. Keyword results first, then semantic fills in what keyword missed.
 
 ```bash
 corvid search "oauth redirect"
