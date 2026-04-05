@@ -4,53 +4,72 @@ Cross-project memory for Claude Code with semantic search. One command: `/rememb
 
 ## The problem
 
-Claude Code forgets everything between sessions. Its built-in memory is per-project, caps at 200 lines, and has no search. You solve a hard problem in one project, start a new project next month, and Claude has no idea it ever happened.
+Claude Code forgets everything between sessions. You spend an hour figuring something out, close the terminal, and next time Claude starts from zero.
 
-claude-wiki fixes that. Say `/remember` and Claude writes what you learned into a searchable wiki. Every project feeds the same knowledge base. Search finds articles by meaning, not just keywords, using a 33MB local embedding model that runs on CPU.
+Its built-in memory does not solve this. Here is what it actually does:
+
+- It saves small notes to `~/.claude/projects/<your-project>/memory/`
+- Those notes only load when you are in that specific project
+- It truncates at 200 lines, so longer findings get cut off
+- There is no search. Claude reads the files top to bottom and hopes the relevant one is near the top
+- Claude decides what to save automatically, so you cannot control what sticks
+
+That works for simple per-project preferences like "use tabs not spaces." It does not work when you need knowledge to travel between projects, or when the thing you learned is too detailed for 200 lines, or when you need to find something you saved three months ago.
+
+claude-wiki fixes that.
 
 | | Built-in memory | claude-wiki |
 |---|---|---|
-| Scope | Per-project | Cross-project |
-| Limit | 200 lines | Unlimited |
-| Search | None | Hybrid: keyword + semantic |
-| Control | Claude decides | You decide with `/remember` |
+| Scope | Per-project only | Cross-project, one wiki for everything |
+| Size limit | Truncates at 200 lines | Unlimited articles, no cap |
+| Search | None, reads files in order | Hybrid: keyword (FTS5) + semantic (33MB model) |
+| What gets saved | Claude decides automatically | You decide with `/remember` |
+| Retrieval | Loaded only in that project | Searchable from any project, any session |
+| Format | Short memory notes | Full articles with tables, numbers, reasoning |
 
 ## How it works
 
-### A lawyer three sessions into diligence
+### A lawyer building a case across sessions
 
-You just found that the target's key customer contract has a change-of-control termination right threatening 38% of ARR.
+You are reviewing a target's contracts and find that a change-of-control clause threatens 38% of ARR. That kind of finding matters beyond this one deal.
 
 ```
 You: /remember
 
 Claude writes:
-  ~/claude-wiki/wiki/contracts/acme-coc-termination-risk.md
+  ~/claude-wiki/wiki/contracts/coc-termination-risk.md
 
-  # Acme Acquisition - Change of Control Risk
-  Key customer contract (38% of ARR, $4.2M) contains change-of-control
-  termination right in Section 12.3. No consent obtained...
+  # Change of Control - Termination Risk Pattern
+  Key customer contract (38% of ARR) contains change-of-control
+  termination right. No consent obtained. Must be closing
+  condition or renegotiated pre-sign...
 ```
 
-Two weeks later, different client, similar deal:
+Two weeks later, different client, similar deal structure:
 
 ```
 You: "Review this target's customer contracts for COC risk"
 
 Claude searches the wiki automatically
-  -> finds the Acme article
-  -> already knows the pattern and what to look for
+  -> finds the article from last deal
+  -> already knows the pattern, the risk, and what to flag
 ```
 
-### A developer who just burned two hours
+The lesson carried over. You never re-explained it.
 
-Your auth flow breaks after deploy. Session cookie needs `SameSite=None` with `Secure` behind a reverse proxy, and the redirect URI must match the exact casing registered with the OAuth provider.
+### A vibe-coder who keeps hitting the same walls
+
+Every few projects, you run into something that takes real time to solve. A deploy config that silently breaks in production. A database migration that works locally but fails on the remote. An API that behaves differently on v2 vs v3 with no mention in the changelog.
 
 ```
+You: "That took way too long to figure out"
 You: /remember
+
+Claude writes:
+  ~/claude-wiki/wiki/debugging/postgres-migration-remote-timeout.md
 ```
 
-Three months later, different app, same deploy setup. Claude already knows. Two hours saved.
+Next project, same stack. Claude searches the wiki before you even ask, finds the article, and skips the debugging entirely. The more you use it, the fewer hours you waste re-solving problems you already solved.
 
 ## Inspired by Karpathy's LLM Wiki
 
@@ -86,7 +105,7 @@ Keyword search works out of the box via SQLite FTS5 with Porter stemming and BM2
 
 With `fastembed` + `sqlite-vec` installed, semantic search activates automatically. Searching "concurrent writes deadlock" finds your article about a "race condition" even though it never uses those words. The embedding model ([bge-small-en-v1.5](https://huggingface.co/BAAI/bge-small-en-v1.5)) is 33MB, runs on CPU in ~50ms per article, and needs no GPU, no PyTorch, no server.
 
-Both modes run together. Keyword first, then semantic fills in what keyword missed. If the packages are not installed, it falls back to keyword-only silently.
+Both modes run together. Keyword first, then semantic fills in what keyword missed. Falls back to keyword-only silently if the packages are not installed.
 
 ```bash
 python3 ~/claude-wiki/wiki.py search "change of control"
@@ -106,22 +125,22 @@ Claude writes markdown articles organized by category. You never touch the struc
   wiki/
     contracts/
       indemnity-cap-carveouts.md
-      termination-for-convenience.md
+      coc-termination-risk.md
     litigation/
       discovery-scope-preservation.md
     debugging/
-      oauth-redirect-behind-proxy.md
+      postgres-migration-remote-timeout.md
 ```
 
 Real articles with tables, exact numbers, specific commands, reasoning. Not chat logs.
 
 ## Use cases
 
-**Legal**: diligence findings that carry across deals, clause review patterns, jurisdictional research, settlement positions with exact dollar figures.
+**Legal professionals**: diligence findings that carry across deals, clause patterns that worked (or did not), jurisdictional research you do not want to redo, settlement positions with exact figures and deadlines.
 
-**Technical**: architecture decisions and why, deployment fixes with the exact config, API quirks that took hours to find, evaluation results with real numbers.
+**Developers**: the deploy fix that took three hours and you never want to debug again, the API behavior that is not in the docs, architecture decisions and the reasoning behind them.
 
-**Anything multi-project**: you learn it once, `/remember`, it is there forever.
+**Anyone working across projects**: you learn it once, `/remember`, Claude has it forever.
 
 ## Commands
 
