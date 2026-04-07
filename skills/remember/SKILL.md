@@ -24,19 +24,36 @@ You maintain a personal knowledge wiki at `~/corvid/wiki/`. When the user says `
 
 1. **Distill**: Extract the key insight, decision, finding, or lesson from the conversation. Write it as a concise, useful article, not a raw dump. Think: "what would be useful to know 6 months from now?"
 
-2. **Check INDEX.md**: Read `~/corvid/INDEX.md` to see if a related article already exists.
-   - If yes: read that article and UPDATE it with the new information
-   - If no: create a new article
+2. **Search first**: Run `corvid search "<topic>" --json` to check if a related article already exists.
+   - Also check `~/corvid/INDEX.md` for the table of contents
+   - If a related article exists: read it and UPDATE with the new information
+   - If no match: create a new article
 
 3. **Write the article**: Save to `~/corvid/wiki/<category>/<slug>.md`
    - Pick a category from existing ones, or create a new one if nothing fits
    - Use a descriptive slug: `auth-token-rotation.md`, not `note-001.md`
-   - Format: `# Title`, then clear, scannable content with headers/bullets/tables as needed
+   - Format:
+     ```
+     # Title
+     tags: keyword1, keyword2, keyword3
+     ```
+     Then clear, scannable content with headers/bullets/tables as needed
+   - **Always include a `tags:` line** after the title with 2-5 lowercase keywords for search filtering
    - Include: what, why, and any specific values/commands/gotchas worth remembering
 
 4. **Index it**: Run `corvid index <filepath>`
 
 5. **Update INDEX.md**: Add or update the one-line entry in `~/corvid/INDEX.md`
+
+## Searching
+
+```bash
+corvid search "<query>" --json              # hybrid keyword + semantic search
+corvid search "<query>" --tags auth,deploy   # filter by tags before searching
+corvid facts <subject>                       # check known facts and superseded ones
+```
+
+Use `--tags` to narrow results when you know the domain. Use `corvid facts` to check if a fact has been superseded before relying on it.
 
 ## INDEX.md Format
 

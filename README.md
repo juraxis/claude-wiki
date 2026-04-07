@@ -57,28 +57,31 @@ Next session, any project, your agent pulls up what you already solved.
 
 ## Search
 
-Two search modes, both local, both fast.
+Two search modes, both local, both fast. Results merged via [Reciprocal Rank Fusion](https://plg.uwaterloo.ca/~gvcormac/cormacksigir09-rrf.pdf) — when both methods agree on a result, it ranks highest.
 
 **Keyword** (always on): [SQLite FTS5](https://www.sqlite.org/fts5.html) with Porter stemming and BM25 ranking. "Finetuning" matches "fine-tuned." Zero dependencies.
 
 **Semantic** (full install): [fastembed](https://github.com/qdrant/fastembed) generates embeddings with a 33MB model ([bge-small-en-v1.5](https://huggingface.co/BAAI/bge-small-en-v1.5)), [sqlite-vec](https://github.com/asg017/sqlite-vec) stores and searches them inside the same SQLite database. "Login callback issue" finds your article about "OAuth redirect" even though it never uses those words. Runs on CPU in ~50ms. No GPU. No server. No API calls.
 
-Both modes run together. Keyword results first, then semantic fills in what keyword missed.
+**Tag filtering**: Articles can include a `tags:` line. Search with `--tags` to narrow results before computing similarity — fewer results, higher precision.
 
 ```bash
 corvid search "oauth redirect"
+corvid search "deploy config" --tags gcp,docker
 corvid search "liability caps" --json
-corvid stats
 ```
 
 ## Built-in memory vs corvid
+
+No clash — they complement. Built-in memory loads everything every turn for project prefs; corvid uses embeddings to retrieve only what's relevant, so you store more knowledge while consuming fewer tokens per conversation.
 
 | | Built-in | corvid |
 |---|---|---|
 | Scope | Per-project | Cross-project |
 | Limit | ~200 lines | Unlimited |
-| Search | None | Keyword + semantic |
-| Control | Agent decides | You decide with `/remember` |
+| Retrieval | Entire file loaded into context | Search by keyword + semantic similarity |
+| Token cost | Grows with memory size | Only relevant results enter context |
+| Control | You or agent decides | You decide with `/remember` |
 
 ## What people save
 
@@ -91,7 +94,7 @@ corvid stats
 
 ## What gets saved
 
-Your agent writes markdown articles by category. You never touch the structure.
+Your agent writes markdown articles by category with tags for search filtering. You never touch the structure.
 
 ```
 ~/corvid/
@@ -99,18 +102,30 @@ Your agent writes markdown articles by category. You never touch the structure.
   INDEX.md           # table of contents your agent maintains
   wiki/
     auth/
-      google-oauth-deploy-gotchas.md
+      google-oauth-deploy-gotchas.md    # tags: auth, deploy, oauth
     contracts/
-      liability-cap-types.md
+      liability-cap-types.md            # tags: contracts, liability
     backend/
-      supabase-rls-service-role.md
+      supabase-rls-service-role.md      # tags: supabase, rls, auth
 ```
 
 Real articles with tables, exact values, commands, reasoning. Not chat logs.
 
+## Temporal facts
+
+corvid extracts structured facts from articles during indexing. When a fact changes, the old one gets marked as superseded — not deleted.
+
+```
+$ corvid facts Backend
+  Backend → uses → Postgres 16
+  Backend → uses → Postgres 15 [superseded 2025-11-03]
+```
+
+No more contradicting articles sitting side by side. You know what's current and what's history.
+
 ## Under the hood
 
-One Python file. [SQLite FTS5](https://www.sqlite.org/fts5.html) for keyword search. [sqlite-vec](https://github.com/asg017/sqlite-vec) for vector search. [fastembed](https://github.com/qdrant/fastembed) for embeddings (ONNX, CPU-only, 33MB). Everything local. Database is disposable, rebuild anytime with `corvid index-all`.
+One Python file. [SQLite FTS5](https://www.sqlite.org/fts5.html) for keyword search. [sqlite-vec](https://github.com/asg017/sqlite-vec) for vector search. [fastembed](https://github.com/qdrant/fastembed) for embeddings (ONNX, CPU-only, 33MB). Results ranked by [Reciprocal Rank Fusion](https://plg.uwaterloo.ca/~gvcormac/cormacksigir09-rrf.pdf). Tag-based pre-filtering narrows the search space before computing similarity. Temporal facts table tracks when knowledge gets superseded. Everything local. Database is disposable, rebuild anytime with `corvid index-all`.
 
 ## Commands
 
@@ -119,6 +134,8 @@ One Python file. [SQLite FTS5](https://www.sqlite.org/fts5.html) for keyword sea
 | `corvid install` | Detect agents, install `/remember` skill, init database |
 | `corvid search <query>` | Search (human-readable) |
 | `corvid search <query> --json` | Search (JSON for agents) |
+| `corvid search <q> --tags x,y` | Filter by tags before searching |
+| `corvid facts [subject]` | Show extracted facts (current + superseded) |
 | `corvid index <file>` | Index one markdown file |
 | `corvid index-all` | Re-index everything |
 | `corvid stats` | Show article counts |

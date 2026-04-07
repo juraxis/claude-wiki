@@ -9,11 +9,14 @@ Commands:
     corvid index-all             Re-index entire wiki/ directory
     corvid search <query>        Search (human-readable)
     corvid search <query> --json Search (machine-readable)
+    corvid search <q> --tags x,y Filter by tags before searching
+    corvid facts [subject]       Show extracted facts (temporal)
     corvid stats                 Show article counts
 
 Search modes:
-    Default: hybrid (keyword + semantic). Falls back to keyword-only if
-    fastembed/sqlite-vec are not installed. No config needed.
+    Hybrid: keyword (FTS5/BM25) + semantic (fastembed/sqlite-vec),
+    merged via Reciprocal Rank Fusion. Falls back to keyword-only
+    if fastembed/sqlite-vec are not installed. No config needed.
 """
 
 import sqlite3
@@ -21,6 +24,7 @@ import sys
 import os
 import json
 import hashlib
+import re
 from datetime import datetime
 from pathlib import Path
 
@@ -81,6 +85,26 @@ def get_db():
     ).fetchone()
     if not tables:
         _init_schema(conn)
+    # Auto-migrate: add tags column if missing
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(articles)").fetchall()}
+    if "tags" not in cols:
+        conn.execute("ALTER TABLE articles ADD COLUMN tags TEXT DEFAULT '[]'")
+    # Auto-migrate: add facts table if missing
+    facts_exists = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='facts'"
+    ).fetchone()
+    if not facts_exists:
+        conn.executescript("""
+            CREATE TABLE facts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                subject TEXT NOT NULL, predicate TEXT NOT NULL, object TEXT NOT NULL,
+                article_id INTEGER REFERENCES articles(id),
+                valid_from TEXT NOT NULL, valid_to TEXT,
+                extracted_at TEXT NOT NULL
+            );
+            CREATE INDEX idx_facts_subj ON facts(subject);
+            CREATE INDEX idx_facts_pred ON facts(subject, predicate);
+        """)
     # Auto-add vec table if semantic became available after initial init
     if _SEMANTIC_AVAILABLE:
         vec_exists = conn.execute(
@@ -102,6 +126,7 @@ def _init_schema(conn):
             filehash TEXT,
             title TEXT,
             category TEXT DEFAULT 'general',
+            tags TEXT DEFAULT '[]',
             content TEXT,
             source_project TEXT,
             indexed_at TEXT,
@@ -134,6 +159,20 @@ def _init_schema(conn):
             VALUES (new.id, new.title, new.category, new.content);
         END;
     """)
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS facts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            subject TEXT NOT NULL,
+            predicate TEXT NOT NULL,
+            object TEXT NOT NULL,
+            article_id INTEGER REFERENCES articles(id),
+            valid_from TEXT NOT NULL,
+            valid_to TEXT,
+            extracted_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_facts_subj ON facts(subject);
+        CREATE INDEX IF NOT EXISTS idx_facts_pred ON facts(subject, predicate);
+    """)
     if _SEMANTIC_AVAILABLE:
         conn.execute(
             f"CREATE VIRTUAL TABLE IF NOT EXISTS articles_vec USING vec0(embedding float[{EMBED_DIM}])"
@@ -158,9 +197,14 @@ def cmd_index(filepath, category=None):
     filehash = hashlib.sha256(content.encode()).hexdigest()
 
     title = os.path.basename(filepath)
+    tags = []
     for line in content.split("\n"):
         if line.startswith("# "):
             title = line[2:].strip()
+        tag_match = re.match(r'^tags:\s*(.+)', line, re.IGNORECASE)
+        if tag_match:
+            tags = [t.strip().lower() for t in tag_match.group(1).split(",") if t.strip()]
+        if title != os.path.basename(filepath) and tags:
             break
 
     if category is None:
@@ -181,12 +225,13 @@ def cmd_index(filepath, category=None):
             if existing["filehash"] == filehash:
                 print(f"UNCHANGED: {title}")
                 return False
+            tags_json = json.dumps(tags)
             conn.execute(
                 """UPDATE articles
-                   SET filehash=?, title=?, category=?, content=?,
+                   SET filehash=?, title=?, category=?, tags=?, content=?,
                        source_project=?, updated_at=?
                    WHERE filepath=?""",
-                (filehash, title, category, content, source_project, now, filepath),
+                (filehash, title, category, tags_json, content, source_project, now, filepath),
             )
             conn.commit()
             article_id = existing["id"]
@@ -200,14 +245,16 @@ def cmd_index(filepath, category=None):
                         (article_id, json.dumps(vec)),
                     )
                     conn.commit()
+            _upsert_facts(conn, article_id, _extract_facts(content), now)
             print(f"UPDATED: {title} [{category}]")
             return True
         else:
+            tags_json = json.dumps(tags)
             conn.execute(
                 """INSERT INTO articles
-                   (filepath, filehash, title, category, content, source_project, indexed_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                (filepath, filehash, title, category, content, source_project, now, now),
+                   (filepath, filehash, title, category, tags, content, source_project, indexed_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (filepath, filehash, title, category, tags_json, content, source_project, now, now),
             )
             conn.commit()
             article_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
@@ -220,6 +267,7 @@ def cmd_index(filepath, category=None):
                         (article_id, json.dumps(vec)),
                     )
                     conn.commit()
+            _upsert_facts(conn, article_id, _extract_facts(content), now)
             print(f"INDEXED: {title} [{category}]")
             return True
     except sqlite3.Error as e:
@@ -229,16 +277,139 @@ def cmd_index(filepath, category=None):
         conn.close()
 
 
-# ── Search ─────────────────────────────────────────────────────
-def _keyword_search(conn, query, limit):
-    """FTS5 keyword search with BM25 ranking."""
+# ── Facts ─────────────────────────────────────────────────────
+_FACT_PATTERNS = [
+    # "X uses Y", "X runs Y", "X requires Y"
+    re.compile(r'^[-*]?\s*(?:the\s+)?(.+?)\s+(?:uses?|runs?|requires?|needs?)\s+(.+?)\.?\s*$', re.IGNORECASE),
+    # "X is Y", "X was Y"
+    re.compile(r'^[-*]?\s*(?:the\s+)?(.+?)\s+(?:is|was|are)\s+(.+?)\.?\s*$', re.IGNORECASE),
+    # "X: Y" (key-value style in bullet points)
+    re.compile(r'^[-*]\s*([^:]{3,40}):\s+(.+?)\.?\s*$'),
+    # "X version Y" / "X v1.2.3"
+    re.compile(r'^[-*]?\s*(?:the\s+)?(.+?)\s+(?:version|v)\s*([\d][\d.]+\S*)\.?\s*$', re.IGNORECASE),
+    # "deploy to X", "hosted on X"
+    re.compile(r'^[-*]?\s*(?:deploy(?:ed)?\s+to|hosted\s+on|running\s+on)\s+(.+?)\.?\s*$', re.IGNORECASE),
+]
+
+
+def _extract_facts(content):
+    """Extract structured facts from article content. Returns list of (subject, predicate, object)."""
+    facts = []
+    for line in content.split("\n"):
+        line = line.strip()
+        if not line or line.startswith("#") or line.startswith("```"):
+            continue
+        for pattern in _FACT_PATTERNS:
+            m = pattern.match(line)
+            if m:
+                groups = m.groups()
+                if len(groups) == 2:
+                    subj, obj = groups
+                    # Infer predicate from the matched verb
+                    pred = "relates_to"
+                    for verb in ["uses", "use", "runs", "run", "requires", "require", "needs", "need"]:
+                        if verb in line.lower():
+                            pred = "uses"
+                            break
+                    for verb in ["is", "was", "are"]:
+                        if f" {verb} " in line.lower():
+                            pred = "is"
+                            break
+                    if ":" in line and pattern == _FACT_PATTERNS[2]:
+                        pred = "has"
+                    if "version" in line.lower() or re.search(r'v\d', line):
+                        pred = "version"
+                    facts.append((subj.strip(), pred, obj.strip()))
+                break
+    return facts
+
+
+def _upsert_facts(conn, article_id, facts, now):
+    """Insert facts, invalidating contradictions (same subject+predicate, different object)."""
+    for subj, pred, obj in facts:
+        # Check for existing active fact with same subject+predicate
+        existing = conn.execute(
+            """SELECT id, object FROM facts
+               WHERE subject = ? AND predicate = ? AND valid_to IS NULL""",
+            (subj, pred),
+        ).fetchone()
+        if existing:
+            if existing["object"] == obj:
+                continue  # Same fact, skip
+            # Contradiction: invalidate old fact
+            conn.execute(
+                "UPDATE facts SET valid_to = ? WHERE id = ?",
+                (now, existing["id"]),
+            )
+        conn.execute(
+            """INSERT INTO facts (subject, predicate, object, article_id, valid_from, valid_to, extracted_at)
+               VALUES (?, ?, ?, ?, ?, NULL, ?)""",
+            (subj, pred, obj, article_id, now, now),
+        )
+    conn.commit()
+
+
+def cmd_facts(subject=None):
+    """Show facts, optionally filtered by subject."""
+    conn = get_db()
     try:
+        if subject:
+            rows = conn.execute(
+                """SELECT subject, predicate, object, valid_from, valid_to, article_id
+                   FROM facts WHERE subject LIKE ? ORDER BY valid_from DESC""",
+                (f"%{subject}%",),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """SELECT subject, predicate, object, valid_from, valid_to, article_id
+                   FROM facts WHERE valid_to IS NULL ORDER BY extracted_at DESC LIMIT 50"""
+            ).fetchall()
+    finally:
+        conn.close()
+
+    if not rows:
+        print(f"No facts found{f' for: {subject}' if subject else ''}")
+        return
+
+    print(f"\n{'─' * 60}")
+    print(f" Facts{f' matching: {subject}' if subject else ' (active)'}")
+    print(f"{'─' * 60}\n")
+    for r in rows:
+        status = "" if r["valid_to"] is None else f" [superseded {r['valid_to'][:10]}]"
+        print(f"  {r['subject']} → {r['predicate']} → {r['object']}{status}")
+    print(f"\n{'─' * 60}")
+    print(f" {len(rows)} fact(s)")
+
+
+# ── Search ─────────────────────────────────────────────────────
+def _keyword_search(conn, query, limit, tags=None):
+    """FTS5 keyword search with BM25 ranking, optional tag pre-filter."""
+    try:
+        if tags:
+            tag_clauses = " AND ".join(
+                f"a.tags LIKE '%\"{t}\"%'" for t in tags
+            )
+            return conn.execute(
+                f"""
+                SELECT
+                    a.id, a.title, a.category, a.tags, a.filepath, a.source_project,
+                    a.indexed_at, a.updated_at,
+                    snippet(articles_fts, 2, '>>>', '<<<', '...', 64) AS snippet,
+                    rank
+                FROM articles_fts
+                JOIN articles a ON a.id = articles_fts.rowid
+                WHERE articles_fts MATCH ? AND {tag_clauses}
+                ORDER BY rank
+                LIMIT ?
+                """,
+                (query, limit),
+            ).fetchall()
         return conn.execute(
             """
             SELECT
-                a.id, a.title, a.category, a.filepath, a.source_project,
+                a.id, a.title, a.category, a.tags, a.filepath, a.source_project,
                 a.indexed_at, a.updated_at,
-                snippet(articles_fts, 2, '>>>', '<<<', '...', 40) AS snippet,
+                snippet(articles_fts, 2, '>>>', '<<<', '...', 64) AS snippet,
                 rank
             FROM articles_fts
             JOIN articles a ON a.id = articles_fts.rowid
@@ -252,78 +423,112 @@ def _keyword_search(conn, query, limit):
         return []
 
 
-def _semantic_search(conn, query, limit):
-    """Vector similarity search using fastembed + sqlite-vec."""
+def _semantic_search(conn, query, limit, tags=None):
+    """Vector similarity search using fastembed + sqlite-vec, optional tag pre-filter."""
     if not _SEMANTIC_AVAILABLE:
         return []
     vec = _embed(query)
     if not vec:
         return []
+    # Fetch more candidates if filtering by tags (pre-filter narrows post-query)
+    fetch_k = limit * 3 if tags else limit
     rows = conn.execute(
         """
         SELECT
             v.rowid AS id, v.distance,
-            a.title, a.category, a.filepath, a.source_project,
+            a.title, a.category, a.tags, a.filepath, a.source_project,
             a.indexed_at, a.updated_at, a.content
         FROM articles_vec v
         JOIN articles a ON a.id = v.rowid
         WHERE embedding MATCH ?
             AND k = ?
         """,
-        (json.dumps(vec), limit),
+        (json.dumps(vec), fetch_k),
     ).fetchall()
+    if tags:
+        filtered = []
+        for r in rows:
+            article_tags = json.loads(r["tags"] or "[]")
+            if any(t in article_tags for t in tags):
+                filtered.append(r)
+            if len(filtered) >= limit:
+                break
+        return filtered
     return rows
 
 
-def cmd_search(query, limit=10, as_json=False):
-    """Hybrid search: keyword + semantic, deduplicated and merged."""
+def _best_paragraph(content, query, max_len=300):
+    """Extract the most relevant paragraph from content for a query.
+    Scores paragraphs by word overlap with query terms."""
+    if not content:
+        return ""
+    query_words = set(query.lower().split())
+    paragraphs = [p.strip() for p in re.split(r'\n\s*\n', content) if p.strip()]
+    if not paragraphs:
+        return content[:max_len].replace("\n", " ").strip()
+    best, best_score = paragraphs[0], -1
+    for p in paragraphs:
+        words = set(p.lower().split())
+        score = len(query_words & words)
+        if score > best_score:
+            best, best_score = p, score
+    snippet = best[:max_len].replace("\n", " ").strip()
+    if len(best) > max_len:
+        snippet += "..."
+    return snippet
+
+
+RRF_K = 60  # Standard RRF constant
+
+
+def cmd_search(query, limit=10, as_json=False, tags=None):
+    """Hybrid search: keyword + semantic with Reciprocal Rank Fusion."""
     conn = get_db()
     try:
-        kw_results = _keyword_search(conn, query, limit)
-        sem_results = _semantic_search(conn, query, limit) if _SEMANTIC_AVAILABLE else []
+        kw_results = _keyword_search(conn, query, limit, tags=tags)
+        sem_results = _semantic_search(conn, query, limit, tags=tags) if _SEMANTIC_AVAILABLE else []
     finally:
         conn.close()
 
-    # Merge: keyword results first (ranked by BM25), then semantic results not already in keyword set
-    seen_ids = set()
-    merged = []
+    # Reciprocal Rank Fusion: score = sum of 1/(k+rank) across methods
+    scores = {}   # id -> rrf_score
+    entries = {}   # id -> result dict
 
-    for r in kw_results:
+    for rank, r in enumerate(kw_results):
         rid = r["id"]
-        if rid not in seen_ids:
-            seen_ids.add(rid)
-            merged.append({
+        scores[rid] = scores.get(rid, 0) + 1.0 / (RRF_K + rank + 1)
+        if rid not in entries:
+            entries[rid] = {
                 "id": rid,
                 "title": r["title"],
                 "category": r["category"],
+                "tags": json.loads(r["tags"] or "[]"),
                 "filepath": r["filepath"],
                 "source_project": r["source_project"],
                 "snippet": r["snippet"],
                 "updated_at": r["updated_at"] or r["indexed_at"] or "",
                 "match": "keyword",
-            })
+            }
 
-    for r in sem_results:
+    for rank, r in enumerate(sem_results):
         rid = r["id"]
-        if rid not in seen_ids:
-            seen_ids.add(rid)
-            content = r["content"] or ""
-            # Build a snippet from first 200 chars
-            snippet = content[:200].replace("\n", " ").strip()
-            if len(content) > 200:
-                snippet += "..."
-            merged.append({
+        scores[rid] = scores.get(rid, 0) + 1.0 / (RRF_K + rank + 1)
+        if rid not in entries:
+            entries[rid] = {
                 "id": rid,
                 "title": r["title"],
                 "category": r["category"],
+                "tags": json.loads(r["tags"] or "[]"),
                 "filepath": r["filepath"],
                 "source_project": r["source_project"],
-                "snippet": snippet,
+                "snippet": _best_paragraph(r["content"], query),
                 "updated_at": r["updated_at"] or r["indexed_at"] or "",
                 "match": "semantic",
-            })
+            }
+        else:
+            entries[rid]["match"] = "hybrid"
 
-    merged = merged[:limit]
+    merged = sorted(entries.values(), key=lambda e: scores[e["id"]], reverse=True)[:limit]
 
     if as_json:
         print(json.dumps({
@@ -345,8 +550,9 @@ def cmd_search(query, limit=10, as_json=False):
     for r in merged:
         date = r["updated_at"][:10] if r["updated_at"] else "unknown"
         match_tag = f" ({r['match']})" if _SEMANTIC_AVAILABLE else ""
+        tag_str = f"  Tags: {', '.join(r['tags'])}" if r["tags"] else ""
         print(f"  [{r['category']}] {r['title']}{match_tag}")
-        print(f"  Date: {date}  |  Project: {r['source_project'] or 'n/a'}")
+        print(f"  Date: {date}  |  Project: {r['source_project'] or 'n/a'}{tag_str}")
         print(f"  {r['snippet']}\n")
     print(f"{'─' * 60}")
     print(f" {len(merged)} result(s)")
@@ -440,19 +646,36 @@ _SKILL_MD = textwrap.dedent("""\
 
     1. **Distill**: Extract the key insight, decision, finding, or lesson from the conversation. Write it as a concise, useful article, not a raw dump. Think: "what would be useful to know 6 months from now?"
 
-    2. **Check INDEX.md**: Read `~/corvid/INDEX.md` to see if a related article already exists.
-       - If yes: read that article and UPDATE it with the new information
-       - If no: create a new article
+    2. **Search first**: Run `corvid search "<topic>" --json` to check if a related article already exists.
+       - Also check `~/corvid/INDEX.md` for the table of contents
+       - If a related article exists: read it and UPDATE with the new information
+       - If no match: create a new article
 
     3. **Write the article**: Save to `~/corvid/wiki/<category>/<slug>.md`
        - Pick a category from existing ones, or create a new one if nothing fits
        - Use a descriptive slug: `auth-token-rotation.md`, not `note-001.md`
-       - Format: `# Title`, then clear, scannable content with headers/bullets/tables as needed
+       - Format:
+         ```
+         # Title
+         tags: keyword1, keyword2, keyword3
+         ```
+         Then clear, scannable content with headers/bullets/tables as needed
+       - **Always include a `tags:` line** after the title with 2-5 lowercase keywords for search filtering
        - Include: what, why, and any specific values/commands/gotchas worth remembering
 
     4. **Index it**: Run `corvid index <filepath>`
 
     5. **Update INDEX.md**: Add or update the one-line entry in `~/corvid/INDEX.md`
+
+    ## Searching
+
+    ```bash
+    corvid search "<query>" --json              # hybrid keyword + semantic search
+    corvid search "<query>" --tags auth,deploy   # filter by tags before searching
+    corvid facts <subject>                       # check known facts and superseded ones
+    ```
+
+    Use `--tags` to narrow results when you know the domain. Use `corvid facts` to check if a fact has been superseded before relying on it.
 
     ## INDEX.md Format
 
@@ -573,12 +796,27 @@ def main():
 
     elif cmd == "search":
         if len(sys.argv) < 3:
-            print("Usage: wiki.py search <query> [--json]")
+            print("Usage: corvid search <query> [--json] [--tags tag1,tag2]")
             return
         as_json = "--json" in sys.argv
-        args = [a for a in sys.argv[2:] if a != "--json"]
-        query = " ".join(args)
-        cmd_search(query, as_json=as_json)
+        tags = None
+        remaining = []
+        i = 2
+        while i < len(sys.argv):
+            if sys.argv[i] == "--json":
+                i += 1
+            elif sys.argv[i] == "--tags" and i + 1 < len(sys.argv):
+                tags = [t.strip().lower() for t in sys.argv[i + 1].split(",")]
+                i += 2
+            else:
+                remaining.append(sys.argv[i])
+                i += 1
+        query = " ".join(remaining)
+        cmd_search(query, as_json=as_json, tags=tags)
+
+    elif cmd == "facts":
+        subject = " ".join(sys.argv[2:]) if len(sys.argv) > 2 else None
+        cmd_facts(subject)
 
     elif cmd == "stats":
         cmd_stats()
